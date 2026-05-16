@@ -137,6 +137,20 @@
     </div>
   </div>
 
+  <div id="directSaveOverlay" class="direct-save-overlay" hidden>
+    <div class="direct-save-overlay__backdrop" aria-hidden="true"></div>
+    <div class="direct-save-overlay__dialog" role="dialog" aria-modal="true" aria-labelledby="directSaveTitle">
+      <h3 id="directSaveTitle">接收文件</h3>
+      <p id="directSaveMessage">对方正在通过局域网直连发送文件。</p>
+      <div id="directSaveMeta" class="direct-save-overlay__meta"></div>
+      <div class="direct-save-overlay__actions">
+        <button id="directSaveCancel" type="button">拒绝</button>
+        <button id="directSaveTemp" type="button">临时接收</button>
+        <button id="directSaveConfirm" type="button" class="primary">实时保存</button>
+      </div>
+    </div>
+  </div>
+
   <script type="module" src="./app.js"></script>
 </body>
 

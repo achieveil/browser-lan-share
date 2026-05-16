@@ -446,6 +446,22 @@ button:disabled {
   margin-top: 0.25rem;
 }
 
+.transfer-actions button {
+  padding: 0.45rem 0.8rem;
+  border-radius: 8px;
+  font-size: 0.88rem;
+}
+
+.secondary-action {
+  background: #f8fafc;
+  color: #1e3a8a;
+  border: 1px solid #cbd5e1;
+}
+
+.secondary-action:hover {
+  background: #e0f2fe;
+}
+
 .download-link-disabled {
   color: #94a3b8;
   cursor: default;
@@ -531,7 +547,8 @@ textarea {
   display: none;
 }
 
-.clipboard-overlay {
+.clipboard-overlay,
+.direct-save-overlay {
   position: fixed;
   inset: 0;
   z-index: 2000;
@@ -540,13 +557,15 @@ textarea {
   justify-content: center;
 }
 
-.clipboard-overlay__backdrop {
+.clipboard-overlay__backdrop,
+.direct-save-overlay__backdrop {
   position: absolute;
   inset: 0;
   background: rgba(15, 23, 42, 0.55);
 }
 
-.clipboard-overlay__dialog {
+.clipboard-overlay__dialog,
+.direct-save-overlay__dialog {
   position: relative;
   background: #ffffff;
   border-radius: 18px;
@@ -560,13 +579,15 @@ textarea {
   z-index: 1;
 }
 
-.clipboard-overlay__dialog h3 {
+.clipboard-overlay__dialog h3,
+.direct-save-overlay__dialog h3 {
   margin: 0;
   font-size: 1.4rem;
   color: #0f172a;
 }
 
-.clipboard-overlay__dialog p {
+.clipboard-overlay__dialog p,
+.direct-save-overlay__dialog p {
   margin: 0;
   color: #475569;
   font-size: 0.95rem;
@@ -596,13 +617,16 @@ textarea {
   min-height: 1.2em;
 }
 
-.clipboard-overlay__actions {
+.clipboard-overlay__actions,
+.direct-save-overlay__actions {
   display: flex;
   justify-content: flex-end;
   gap: 0.75rem;
+  flex-wrap: wrap;
 }
 
-.clipboard-overlay__actions button {
+.clipboard-overlay__actions button,
+.direct-save-overlay__actions button {
   min-width: 4.5rem;
   padding: 0.6rem 1.2rem;
   border-radius: 999px;
@@ -613,18 +637,35 @@ textarea {
   cursor: pointer;
 }
 
-.clipboard-overlay__actions button:hover {
+.clipboard-overlay__actions button:hover,
+.direct-save-overlay__actions button:hover {
   background: #e0e7ff;
 }
 
-.clipboard-overlay__actions .primary {
+.clipboard-overlay__actions .primary,
+.direct-save-overlay__actions .primary {
   background: #2563eb;
   color: #fff;
   border: none;
 }
 
-.clipboard-overlay__actions .primary:hover {
+.clipboard-overlay__actions .primary:hover,
+.direct-save-overlay__actions .primary:hover {
   background: #1d4ed8;
+}
+
+.direct-save-overlay[hidden] {
+  display: none;
+}
+
+.direct-save-overlay__meta {
+  background: #f8fafc;
+  border: 1px solid #dbe3f0;
+  color: #334155;
+  padding: 0.85rem 1rem;
+  font-size: 0.9rem;
+  line-height: 1.45;
+  word-break: break-word;
 }
 
 @media (max-width: 1024px) {

@@ -1,3 +1,5 @@
+import { createSHA256 } from './vendor/hash-wasm/index.esm.js';
+
 const dom = {
   displayName: document.getElementById('displayName'),
   currentDisplayName: document.getElementById('currentDisplayName'),
@@ -28,16 +30,28 @@ const dom = {
   clipboardOverlayMessage: document.getElementById('clipboardOverlayMessage'),
   clipboardOverlayPreview: document.getElementById('clipboardOverlayPreview'),
   clipboardOverlayTitle: document.getElementById('clipboardOverlayTitle'),
+  directSaveOverlay: document.getElementById('directSaveOverlay'),
+  directSaveTitle: document.getElementById('directSaveTitle'),
+  directSaveMessage: document.getElementById('directSaveMessage'),
+  directSaveMeta: document.getElementById('directSaveMeta'),
+  directSaveConfirm: document.getElementById('directSaveConfirm'),
+  directSaveTemp: document.getElementById('directSaveTemp'),
+  directSaveCancel: document.getElementById('directSaveCancel'),
 };
 
 const statusPanels = Array.from(document.querySelectorAll('.status-panel'));
 
 const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
 const FILE_CHUNK_SIZE = 64 * 1024;
-const WS_FALLBACK_CHUNK_SIZE = 32 * 1024;
+const DIRECT_FILE_CHUNK_SIZE = 256 * 1024;
+const DIRECT_MEMORY_LIMIT = 256 * 1024 * 1024;
+const DIRECT_CONNECT_TIMEOUT = 8000;
+const DIRECT_CONTROL_TIMEOUT = 15000;
+const DIRECT_CHUNK_ACK_TIMEOUT = 30000;
+const HTTP_FILE_CHUNK_SIZE = 4 * 1024 * 1024;
 const WS_RECONNECT_BASE_DELAY = 1500;
 const WS_RECONNECT_MAX_DELAY = 15000;
-const WS_BUFFER_THRESHOLD = 4 * 1024 * 1024;
+const SHORT_HASH_LENGTH = 12;
 
 const state = {
   selfId: null,
@@ -54,6 +68,8 @@ const state = {
   wsReconnectAttempts: 0,
   lastClipboardPayload: null,
   clipboardTextLinkedPayload: null,
+  directControlWaiters: new Map(),
+  directChunkAckWaiters: new Map(),
 };
 
 const peerLabel = (peerId) => state.peers.get(peerId)?.displayName || peerId;
@@ -88,7 +104,7 @@ const ACTIVITY_LABELS = {
   error: '错误',
 };
 const SILENCED_OUTBOUND_TYPES = new Set(['pong', 'file-transfer-chunk']);
-const SILENCED_INBOUND_TYPES = new Set(['pong', 'ping', 'file-transfer-chunk']);
+const SILENCED_INBOUND_TYPES = new Set(['pong', 'ping', 'file-transfer-chunk', 'large-file-progress']);
 
 const truncate = (text, length = 80) => {
   if (typeof text !== 'string') return '';
@@ -128,8 +144,53 @@ const withTimeout = (promise, ms, errorMessage) =>
       });
   });
 
+const readJsonResponse = async (response) => {
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = null;
+  }
+  if (!response.ok) {
+    throw new Error(payload?.error || payload?.message || `请求失败：${response.status}`);
+  }
+  return payload || {};
+};
+
+const createSha256 = async () => {
+  const hasher = await createSHA256();
+  hasher.init();
+  return hasher;
+};
+
+const hashBytes = async (hasher, bytes) => {
+  hasher.init();
+  hasher.update(bytes);
+  return hasher.digest('hex');
+};
+
+const shortHash = (value) =>
+  typeof value === 'string' && value
+    ? `${value.slice(0, SHORT_HASH_LENGTH)}…`
+    : '未知';
+
 const dataChannelKey = (peerId) => `dc:${peerId}`;
 const relayKey = (transferId) => `relay:${transferId}`;
+const directKey = (transferId) => `direct:${transferId}`;
+const directAckKey = (transferId, index) => `${transferId}:${index}`;
+
+const createFallbackError = (message) => {
+  const error = new Error(message);
+  error.fallbackToRelay = true;
+  return error;
+};
+
+const supportsOriginPrivateFileSystem = () =>
+  Boolean(navigator.storage && typeof navigator.storage.getDirectory === 'function');
+
+const supportsDirectSaveToDisk = () =>
+  typeof window.showSaveFilePicker === 'function' &&
+  typeof WritableStream !== 'undefined';
 
 const bufferToBase64 = (buffer) => {
   const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
@@ -742,6 +803,499 @@ const triggerDownload = (blob, filename) => {
   return url;
 };
 
+const triggerDownloadUrl = (url, filename) => {
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename || '接收文件';
+  link.rel = 'noopener';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+};
+
+const supportsVerifiedStreamingDownload = () =>
+  typeof window.showSaveFilePicker === 'function' &&
+  typeof ReadableStream !== 'undefined' &&
+  typeof WritableStream !== 'undefined';
+
+const downloadWithVerification = async (payload, display) => {
+  if (!supportsVerifiedStreamingDownload()) {
+    throw new Error('当前浏览器不支持流式校验保存。');
+  }
+
+  const filename = payload.name || '接收文件';
+  let fileHandle;
+  try {
+    fileHandle = await window.showSaveFilePicker({
+      suggestedName: filename,
+    });
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      updateTransferDisplay(display, {
+        status: '已取消选择保存位置。',
+      });
+      return;
+    }
+    throw error;
+  }
+
+  const response = await fetch(payload.downloadUrl, { cache: 'no-store' });
+  if (!response.ok || !response.body) {
+    throw new Error(`下载请求失败：${response.status}`);
+  }
+
+  const writable = await fileHandle.createWritable();
+  const reader = response.body.getReader();
+  const hasher = await createSha256();
+  const expectedSize = payload.size || Number(response.headers.get('content-length')) || 0;
+  let receivedBytes = 0;
+  let closed = false;
+
+  try {
+    while (true) {
+      // eslint-disable-next-line no-await-in-loop
+      const { done, value } = await reader.read();
+      if (done) break;
+      hasher.update(value);
+      // eslint-disable-next-line no-await-in-loop
+      await writable.write(value);
+      receivedBytes += value.byteLength;
+      const percent = expectedSize
+        ? Math.min(100, Math.round((receivedBytes / expectedSize) * 100))
+        : 0;
+      updateTransferDisplay(display, {
+        percent,
+        status: `正在保存并校验 ${percent}%`,
+      });
+    }
+
+    const digest = hasher.digest('hex');
+    if (payload.sha256 && digest !== payload.sha256) {
+      throw new Error('下载后的 SHA-256 与发送端不一致。');
+    }
+    await writable.close();
+    closed = true;
+    completeTransferDisplay(display, `已下载并校验 SHA-256：${shortHash(digest)}`);
+    appendStatus(dom.fileStatus, `文件 "${filename}" 已保存，SHA-256 校验通过。`);
+  } finally {
+    if (!closed) {
+      await writable.abort().catch(() => {});
+    }
+  }
+};
+
+const appendDownloadActions = (display, payload) => {
+  const filename = payload.name || '接收文件';
+  const actions = document.createElement('div');
+  actions.className = 'transfer-actions';
+
+  const nativeLink = document.createElement('a');
+  nativeLink.href = payload.downloadUrl;
+  nativeLink.download = filename;
+  nativeLink.textContent = `下载 ${filename}`;
+  nativeLink.className = 'download-link';
+  nativeLink.rel = 'noopener';
+  actions.appendChild(nativeLink);
+
+  if (supportsVerifiedStreamingDownload()) {
+    const verifiedButton = document.createElement('button');
+    verifiedButton.type = 'button';
+    verifiedButton.className = 'secondary-action';
+    verifiedButton.textContent = '校验下载';
+    verifiedButton.addEventListener('click', async () => {
+      verifiedButton.disabled = true;
+      try {
+        await downloadWithVerification(payload, display);
+      } catch (error) {
+        failTransferDisplay(display, `校验下载失败：${error.message}`);
+        appendStatus(dom.fileStatus, `校验下载失败：${error.message}`);
+      } finally {
+        verifiedButton.disabled = false;
+      }
+    });
+    actions.appendChild(verifiedButton);
+  }
+
+  if (display) {
+    display.entry.appendChild(actions);
+    updateStatusPanelScroll(dom.fileStatus);
+  } else if (dom.fileStatus) {
+    dom.fileStatus.appendChild(actions);
+    updateStatusPanelScroll(dom.fileStatus);
+  }
+
+  const expiresIn = payload.expiresAt
+    ? Math.max(0, payload.expiresAt - Date.now())
+    : 2 * 60 * 60 * 1000;
+  setTimeout(() => {
+    if (nativeLink.isConnected) {
+      nativeLink.textContent = `${filename} 下载链接已过期`;
+      nativeLink.removeAttribute('href');
+      nativeLink.classList.add('download-link-disabled');
+    }
+  }, Math.min(expiresIn, 2 ** 31 - 1));
+};
+
+const sendDataChannelMessage = (channel, message) => {
+  if (!channel || channel.readyState !== 'open') {
+    throw createFallbackError('局域网直连通道尚未打开。');
+  }
+  channel.send(JSON.stringify(message));
+};
+
+const waitForDirectControl = (transferId, expectedTypes, peerId, timeout = DIRECT_CONTROL_TIMEOUT) =>
+  new Promise((resolve, reject) => {
+    const expected = new Set(Array.isArray(expectedTypes) ? expectedTypes : [expectedTypes]);
+    const timer = setTimeout(() => {
+      state.directControlWaiters.delete(transferId);
+      reject(createFallbackError('等待直连响应超时。'));
+    }, timeout);
+    state.directControlWaiters.set(transferId, {
+      peerId,
+      expected,
+      resolve: (message) => {
+        clearTimeout(timer);
+        resolve(message);
+      },
+      reject: (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    });
+  });
+
+const settleDirectControl = (message) => {
+  const transferId = message.id || message.transferId;
+  if (!transferId) return false;
+  const waiter = state.directControlWaiters.get(transferId);
+  if (!waiter || !waiter.expected.has(message.type)) return false;
+  state.directControlWaiters.delete(transferId);
+  waiter.resolve(message);
+  return true;
+};
+
+const waitForDirectChunkAck = (transferId, index, peerId) =>
+  new Promise((resolve, reject) => {
+    const key = directAckKey(transferId, index);
+    const timer = setTimeout(() => {
+      state.directChunkAckWaiters.delete(key);
+      reject(createFallbackError('等待直连分片确认超时。'));
+    }, DIRECT_CHUNK_ACK_TIMEOUT);
+    state.directChunkAckWaiters.set(key, {
+      peerId,
+      resolve: (message) => {
+        clearTimeout(timer);
+        resolve(message);
+      },
+      reject: (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    });
+  });
+
+const settleDirectChunkAck = (message) => {
+  const key = directAckKey(message.id, message.index);
+  const waiter = state.directChunkAckWaiters.get(key);
+  if (!waiter) return false;
+  state.directChunkAckWaiters.delete(key);
+  waiter.resolve(message);
+  return true;
+};
+
+const rejectDirectWaiters = (peerId, error) => {
+  for (const [transferId, waiter] of state.directControlWaiters.entries()) {
+    if (waiter.peerId !== peerId) continue;
+    state.directControlWaiters.delete(transferId);
+    waiter.reject(error);
+  }
+  for (const [key, waiter] of state.directChunkAckWaiters.entries()) {
+    if (waiter.peerId !== peerId) continue;
+    state.directChunkAckWaiters.delete(key);
+    waiter.reject(error);
+  }
+};
+
+const rejectDirectWaitersForTransfer = (transferId, error) => {
+  const controlWaiter = state.directControlWaiters.get(transferId);
+  if (controlWaiter) {
+    state.directControlWaiters.delete(transferId);
+    controlWaiter.reject(error);
+  }
+  for (const [key, waiter] of state.directChunkAckWaiters.entries()) {
+    if (!key.startsWith(`${transferId}:`)) continue;
+    state.directChunkAckWaiters.delete(key);
+    waiter.reject(error);
+  }
+};
+
+const directSaveOverlayState = {
+  active: false,
+  resolve: null,
+  cleanup: null,
+  restoreFocus: null,
+};
+
+const closeDirectSaveOverlay = (result) => {
+  if (!dom.directSaveOverlay) return;
+  if (typeof directSaveOverlayState.cleanup === 'function') {
+    directSaveOverlayState.cleanup();
+  }
+  dom.directSaveOverlay.hidden = true;
+  if (dom.directSaveMeta) {
+    dom.directSaveMeta.textContent = '';
+  }
+  if (dom.directSaveMessage) {
+    dom.directSaveMessage.textContent = '';
+  }
+  if (directSaveOverlayState.restoreFocus && typeof directSaveOverlayState.restoreFocus.focus === 'function') {
+    directSaveOverlayState.restoreFocus.focus();
+  }
+  const resolver = directSaveOverlayState.resolve;
+  directSaveOverlayState.active = false;
+  directSaveOverlayState.resolve = null;
+  directSaveOverlayState.cleanup = null;
+  directSaveOverlayState.restoreFocus = null;
+  if (resolver) {
+    resolver(result || { action: 'reject', message: '接收方取消了文件接收。' });
+  }
+};
+
+const openDirectSaveOverlay = ({ peerName, name, size, mime }) => {
+  if (!dom.directSaveOverlay) {
+    return Promise.resolve({ action: 'temp' });
+  }
+  if (directSaveOverlayState.active) {
+    closeDirectSaveOverlay({
+      action: 'reject',
+      message: '已有文件接收确认正在处理。',
+    });
+  }
+
+  return new Promise((resolve) => {
+    directSaveOverlayState.active = true;
+    directSaveOverlayState.resolve = resolve;
+    directSaveOverlayState.restoreFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+
+    if (dom.directSaveTitle) {
+      dom.directSaveTitle.textContent = '接收文件';
+    }
+    if (dom.directSaveMessage) {
+      dom.directSaveMessage.textContent = `${peerName} 正在通过局域网直连发送文件。`;
+    }
+    if (dom.directSaveMeta) {
+      const format = mime ? ` · ${mime}` : '';
+      dom.directSaveMeta.textContent = `${name || '未命名文件'} · ${humanFileSize(size)}${format}`;
+    }
+    if (dom.directSaveConfirm) {
+      dom.directSaveConfirm.disabled = !supportsDirectSaveToDisk();
+      dom.directSaveConfirm.textContent = supportsDirectSaveToDisk() ? '实时保存' : '不支持实时保存';
+      dom.directSaveConfirm.title = supportsDirectSaveToDisk()
+        ? '选择保存位置后，数据到达时会直接写入该文件'
+        : '当前浏览器不支持 File System Access API';
+    }
+
+    const handleSave = async () => {
+      if (!supportsDirectSaveToDisk()) {
+        if (dom.directSaveMessage) {
+          dom.directSaveMessage.textContent = '当前浏览器不支持实时保存，请选择临时接收或等待服务器中转。';
+        }
+        return;
+      }
+      try {
+        const fileHandle = await window.showSaveFilePicker({
+          suggestedName: name || '接收文件',
+        });
+        const writable = await fileHandle.createWritable();
+        closeDirectSaveOverlay({
+          action: 'save',
+          storage: 'direct-save',
+          fileHandle,
+          writable,
+        });
+      } catch (error) {
+        if (error?.name === 'AbortError') {
+          if (dom.directSaveMessage) {
+            dom.directSaveMessage.textContent = '未选择保存位置，可以重新选择、临时接收或拒绝。';
+          }
+          return;
+        }
+        if (dom.directSaveMessage) {
+          dom.directSaveMessage.textContent = `打开保存位置失败：${error.message}`;
+        }
+      }
+    };
+
+    const handleTemp = () => {
+      closeDirectSaveOverlay({ action: 'temp' });
+    };
+
+    const handleCancel = () => {
+      closeDirectSaveOverlay({
+        action: 'reject',
+        message: '接收方拒绝了文件接收。',
+      });
+    };
+
+    const handleKeydown = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        handleCancel();
+      }
+    };
+
+    const detach = () => {
+      dom.directSaveConfirm?.removeEventListener('click', handleSave);
+      dom.directSaveTemp?.removeEventListener('click', handleTemp);
+      dom.directSaveCancel?.removeEventListener('click', handleCancel);
+      dom.directSaveOverlay?.removeEventListener('keydown', handleKeydown, true);
+    };
+
+    dom.directSaveConfirm?.addEventListener('click', handleSave);
+    dom.directSaveTemp?.addEventListener('click', handleTemp);
+    dom.directSaveCancel?.addEventListener('click', handleCancel);
+    dom.directSaveOverlay?.addEventListener('keydown', handleKeydown, true);
+    directSaveOverlayState.cleanup = detach;
+    dom.directSaveOverlay.hidden = false;
+
+    setTimeout(() => {
+      if (supportsDirectSaveToDisk()) {
+        dom.directSaveConfirm?.focus();
+      } else {
+        dom.directSaveTemp?.focus();
+      }
+    }, 0);
+  });
+};
+
+const cleanupDirectTransferStorage = async (transfer) => {
+  if (!transfer) return;
+  if (transfer.writable && !transfer.storageClosed) {
+    await transfer.writable.abort().catch(() => {});
+    transfer.storageClosed = true;
+  }
+  if (transfer.opfsRoot && transfer.opfsName) {
+    await transfer.opfsRoot.removeEntry(transfer.opfsName).catch(() => {});
+  }
+};
+
+const createTemporaryDirectReceiveStorage = async (transferId, size) => {
+  if (supportsOriginPrivateFileSystem()) {
+    try {
+      const root = await navigator.storage.getDirectory();
+      const opfsName = `snapsend-${transferId}.part`;
+      const fileHandle = await root.getFileHandle(opfsName, { create: true });
+      const writable = await fileHandle.createWritable();
+      return {
+        storage: 'opfs',
+        fileHandle,
+        writable,
+        opfsRoot: root,
+        opfsName,
+      };
+    } catch (error) {
+      appendStatus(dom.fileStatus, `无法启用浏览器临时文件存储，准备检查内存接收能力：${error.message}`);
+    }
+  }
+
+  if (size <= DIRECT_MEMORY_LIMIT) {
+    return {
+      storage: 'memory',
+      chunks: [],
+    };
+  }
+
+  return null;
+};
+
+const createDirectReceiveStorage = async ({ transferId, peerId, name, size, mime }) => {
+  const choice = await openDirectSaveOverlay({
+    peerName: peerLabel(peerId),
+    name,
+    size,
+    mime,
+  });
+
+  if (choice.action === 'reject') {
+    return {
+      rejected: true,
+      message: choice.message || '接收方拒绝了文件接收。',
+    };
+  }
+
+  if (choice.action === 'save') {
+    return {
+      storage: 'direct-save',
+      fileHandle: choice.fileHandle,
+      writable: choice.writable,
+    };
+  }
+
+  const temporaryStorage = await createTemporaryDirectReceiveStorage(transferId, size);
+  if (temporaryStorage) {
+    return temporaryStorage;
+  }
+
+  return {
+    rejected: true,
+    message: `当前浏览器无法安全直连接收 ${humanFileSize(size)}，请使用服务器中转。`,
+  };
+};
+
+const finalizeDirectDownload = async (transfer, sha256) => {
+  const filename = transfer.meta.name || '接收文件';
+  let blob;
+  if (transfer.storage === 'direct-save') {
+    await transfer.writable.close();
+    transfer.storageClosed = true;
+    if (transfer.display) {
+      completeTransferDisplay(transfer.display, `已实时保存到本地文件，SHA-256：${shortHash(sha256)}`);
+      updateStatusPanelScroll(dom.fileStatus);
+    }
+    appendStatus(dom.fileStatus, `已通过局域网直连实时保存 "${filename}"，SHA-256 校验通过。`);
+    return;
+  }
+
+  if (transfer.storage === 'opfs') {
+    await transfer.writable.close();
+    transfer.storageClosed = true;
+    blob = await transfer.fileHandle.getFile();
+  } else {
+    blob = new Blob(transfer.chunks, {
+      type: transfer.meta.mime || 'application/octet-stream',
+    });
+  }
+
+  const downloadUrl = triggerDownload(blob, filename);
+  const link = document.createElement('a');
+  link.href = downloadUrl;
+  link.download = filename;
+  link.textContent = `重新下载 ${filename}`;
+  link.className = 'download-link';
+  link.rel = 'noopener';
+  const actions = document.createElement('div');
+  actions.className = 'transfer-actions';
+  actions.appendChild(link);
+  if (transfer.display) {
+    completeTransferDisplay(transfer.display, `直连接收完成，SHA-256：${shortHash(sha256)}`);
+    transfer.display.entry.appendChild(actions);
+    updateStatusPanelScroll(dom.fileStatus);
+  }
+  appendStatus(dom.fileStatus, `已通过局域网直连接收 "${filename}"，SHA-256 校验通过。`);
+
+  setTimeout(() => {
+    URL.revokeObjectURL(downloadUrl);
+    if (link.isConnected) {
+      link.textContent = `${filename} 下载链接已过期`;
+      link.removeAttribute('href');
+      link.classList.add('download-link-disabled');
+    }
+    if (transfer.storage === 'opfs') {
+      cleanupDirectTransferStorage(transfer);
+    }
+  }, 5 * 60 * 1000);
+};
+
 const setServerStatus = (text) => {
   if (dom.statusServer) {
     dom.statusServer.textContent = text;
@@ -803,6 +1357,10 @@ const describeOutbound = (type, payload = {}) => {
       const target = payload.targetId ? peerLabel(payload.targetId) : '未知设备';
       return `向 ${target} 发送文件失败：${payload.message || '服务器中转错误'}`;
     }
+    case 'large-file-error': {
+      const target = payload.targetId ? peerLabel(payload.targetId) : '未知设备';
+      return `向 ${target} 发送大文件失败：${payload.message || '传输错误'}`;
+    }
     default:
       return `发送 ${type}`;
   }
@@ -843,6 +1401,17 @@ const describeInbound = (type, payload = {}) => {
         return `向 ${peerLabel(payload.targetId)} 发送文件失败：${payload.message || '服务器中转错误'}`;
       }
       return `${payload.displayName || payload.from || '未知设备'} 的文件发送失败：${payload.message || '服务器中转错误'}`;
+    case 'large-file-meta':
+      return `${payload.displayName || payload.from} 正在上传大文件「${payload.name || '文件'}」`;
+    case 'large-file-progress':
+      return `${payload.from || '对方'} 的大文件已上传 ${payload.percent || 0}%`;
+    case 'large-file-ready':
+      return `${payload.displayName || payload.from} 的大文件「${payload.name || '文件'}」已校验完成`;
+    case 'large-file-error':
+      if (payload?.targetId) {
+        return `向 ${peerLabel(payload.targetId)} 发送大文件失败：${payload.message || '传输错误'}`;
+      }
+      return `${payload.displayName || payload.from || '未知设备'} 的大文件传输失败：${payload.message || '传输错误'}`;
     case 'clipboard-error':
     case 'delivery-error':
     case 'signal-error':
@@ -1027,24 +1596,25 @@ const cleanupPeer = (peerId, options = {}) => {
   }
   for (const [key, transfer] of state.incomingTransfers.entries()) {
     if (transfer.peerId !== peerId) continue;
-    if (transfer.mode === 'relay' && !treatAsOffline) {
+    if ((transfer.mode === 'relay' || transfer.mode === 'http-relay') && !treatAsOffline) {
       continue;
     }
     if (transfer.display) {
-      if (transfer.mode === 'webrtc') {
+      if (transfer.mode === 'webrtc' || transfer.mode === 'direct') {
         failTransferDisplay(transfer.display, '连接已关闭。');
-      } else if (transfer.mode === 'relay') {
+      } else if (transfer.mode === 'relay' || transfer.mode === 'http-relay') {
         failTransferDisplay(transfer.display, '对方已离线，服务器中转已中止。');
       }
     }
+    cleanupDirectTransferStorage(transfer);
     state.incomingTransfers.delete(key);
   }
   const outgoing = state.outgoingTransfers.get(peerId);
   if (outgoing) {
-    const isRelay = outgoing.mode === 'relay';
+    const isRelay = outgoing.mode === 'relay' || outgoing.mode === 'http-relay';
     if (!isRelay || treatAsOffline) {
       if (outgoing.display) {
-        if (outgoing.mode === 'webrtc') {
+        if (outgoing.mode === 'webrtc' || outgoing.mode === 'direct') {
           const filePhrase = outgoing.fileName ? `「${outgoing.fileName}」` : '文件';
           failTransferDisplay(outgoing.display, `连接已关闭，${filePhrase}可能未完成。`);
         } else if (treatAsOffline) {
@@ -1057,20 +1627,21 @@ const cleanupPeer = (peerId, options = {}) => {
   for (const [transferId, trackerInfo] of state.transferTrackers.entries()) {
     if (trackerInfo.peerId !== peerId) continue;
     const tracker = trackerInfo.tracker;
-    if (tracker.mode === 'relay' && !treatAsOffline) {
+    if ((tracker.mode === 'relay' || tracker.mode === 'http-relay') && !treatAsOffline) {
       continue;
     }
     tracker.cancelled = true;
     tracker.cancelledReason = treatAsOffline ? '对方已离线。' : '数据通道连接失败。';
     if (tracker.display) {
       const message =
-        tracker.mode === 'relay' && treatAsOffline
+        (tracker.mode === 'relay' || tracker.mode === 'http-relay') && treatAsOffline
           ? '对方已离线，服务器中转失败。'
           : tracker.cancelledReason;
       failTransferDisplay(tracker.display, message);
     }
     state.transferTrackers.delete(transferId);
   }
+  rejectDirectWaiters(peerId, createFallbackError('局域网直连已断开。'));
   state.orphanCandidates.delete(peerId);
 };
 
@@ -1178,76 +1749,342 @@ const addIceCandidate = async (peerId, candidate) => {
   await applyIceCandidate(context, candidate);
 };
 
+const getPeerChannel = (peerId) => state.peerConnections.get(peerId)?.dataChannel || null;
+
+const sendDirectMessageToPeer = (peerId, message) => {
+  const channel = getPeerChannel(peerId);
+  if (!channel || channel.readyState !== 'open') return false;
+  channel.send(JSON.stringify(message));
+  return true;
+};
+
+const failIncomingDirectTransfer = async (peerId, transfer, message) => {
+  if (transfer?.display) {
+    failTransferDisplay(transfer.display, message);
+  }
+  if (transfer) {
+    await cleanupDirectTransferStorage(transfer);
+    state.incomingTransfers.delete(directKey(transfer.meta.id));
+  }
+  sendDirectMessageToPeer(peerId, {
+    type: 'direct-file-error',
+    id: transfer?.meta?.id,
+    message,
+  });
+};
+
+const handleDirectFileOffer = async (peerId, message) => {
+  const { id, name, size, mime, chunkSize } = message;
+  if (!id || !Number.isFinite(size) || size < 0) {
+    sendDirectMessageToPeer(peerId, {
+      type: 'direct-file-reject',
+      id,
+      message: '直连文件元数据无效。',
+    });
+    return;
+  }
+
+  const storage = await createDirectReceiveStorage({
+    transferId: id,
+    peerId,
+    name,
+    size,
+    mime,
+  });
+  if (storage?.rejected) {
+    sendDirectMessageToPeer(peerId, {
+      type: 'direct-file-reject',
+      id,
+      message: storage.message,
+    });
+    return;
+  }
+
+  const display = createTransferDisplay({
+    direction: 'inbound',
+    peerId,
+    name,
+    size,
+  });
+  const hasher = await createSha256();
+  const chunkHasher = await createSha256();
+  const transfer = {
+    meta: {
+      id,
+      name,
+      size,
+      mime,
+      chunkSize,
+    },
+    receivedBytes: 0,
+    nextIndex: 0,
+    pendingChunk: null,
+    display,
+    peerId,
+    mode: 'direct',
+    hasher,
+    chunkHasher,
+    ...storage,
+  };
+  state.incomingTransfers.set(directKey(id), transfer);
+  updateTransferDisplay(display, {
+    percent: 0,
+    status:
+      storage.storage === 'direct-save'
+        ? '局域网直连已建立，正在实时保存到本地文件…'
+        : storage.storage === 'opfs'
+        ? '局域网直连已建立，正在写入浏览器临时文件…'
+        : '局域网直连已建立，正在内存缓冲接收…',
+  });
+  appendStatus(
+    dom.fileStatus,
+    `准备通过局域网直连接收 ${peerLabel(peerId)} 的 "${name || '文件'}"（${humanFileSize(size)}）。`,
+  );
+  sendDirectMessageToPeer(peerId, {
+    type: 'direct-file-accept',
+    id,
+    storage: storage.storage,
+  });
+};
+
+const handleDirectFileChunkMeta = async (peerId, message) => {
+  const transfer = state.incomingTransfers.get(directKey(message.id));
+  if (!transfer || transfer.peerId !== peerId || transfer.mode !== 'direct') {
+    sendDirectMessageToPeer(peerId, {
+      type: 'direct-file-error',
+      id: message.id,
+      message: '接收端没有找到对应的直连传输。',
+    });
+    return;
+  }
+
+  const { index, offset, size, sha256 } = message;
+  if (
+    index !== transfer.nextIndex ||
+    offset !== transfer.receivedBytes ||
+    !Number.isFinite(size) ||
+    size <= 0 ||
+    !sha256
+  ) {
+    await failIncomingDirectTransfer(peerId, transfer, '直连分片顺序或校验信息异常。');
+    return;
+  }
+
+  transfer.pendingChunk = {
+    index,
+    offset,
+    size,
+    sha256,
+  };
+};
+
+const handleDirectBinaryChunk = async (peerId, data) => {
+  const transfer = Array.from(state.incomingTransfers.values()).find(
+    (item) => item.peerId === peerId && item.mode === 'direct' && item.pendingChunk,
+  );
+  if (!transfer) return;
+
+  const chunkMeta = transfer.pendingChunk;
+  transfer.pendingChunk = null;
+  const bytes = new Uint8Array(data);
+  try {
+    if (bytes.byteLength !== chunkMeta.size) {
+      throw new Error('直连分片大小不一致。');
+    }
+    const chunkHash = await hashBytes(transfer.chunkHasher, bytes);
+    if (chunkHash !== chunkMeta.sha256) {
+      throw new Error('直连分片 SHA-256 校验失败。');
+    }
+
+    if (transfer.storage === 'opfs' || transfer.storage === 'direct-save') {
+      await transfer.writable.write(bytes);
+    } else {
+      transfer.chunks.push(data);
+    }
+    transfer.hasher.update(bytes);
+    transfer.receivedBytes += bytes.byteLength;
+    transfer.nextIndex += 1;
+    const percent = transfer.meta.size
+      ? Math.min(100, Math.round((transfer.receivedBytes / transfer.meta.size) * 100))
+      : 100;
+    updateTransferDisplay(transfer.display, {
+      percent,
+      status: `局域网直连接收 ${percent}% · 已校验分片 ${transfer.nextIndex}`,
+    });
+    sendDirectMessageToPeer(peerId, {
+      type: 'direct-file-chunk-ack',
+      id: transfer.meta.id,
+      index: chunkMeta.index,
+      receivedBytes: transfer.receivedBytes,
+      percent,
+    });
+  } catch (error) {
+    await failIncomingDirectTransfer(peerId, transfer, error.message);
+  }
+};
+
+const handleDirectFileComplete = async (peerId, message) => {
+  const transfer = state.incomingTransfers.get(directKey(message.id));
+  if (!transfer || transfer.peerId !== peerId || transfer.mode !== 'direct') {
+    sendDirectMessageToPeer(peerId, {
+      type: 'direct-file-error',
+      id: message.id,
+      message: '接收端没有找到对应的直连传输。',
+    });
+    return;
+  }
+
+  try {
+    if (transfer.pendingChunk) {
+      throw new Error('还有直连分片未写入。');
+    }
+    if (message.totalChunks !== transfer.nextIndex) {
+      throw new Error('直连分片数量不一致。');
+    }
+    if (transfer.receivedBytes !== transfer.meta.size) {
+      throw new Error('直连接收字节数不一致。');
+    }
+    const digest = transfer.hasher.digest('hex');
+    if (digest !== message.sha256) {
+      throw new Error('直连整文件 SHA-256 校验失败。');
+    }
+    await finalizeDirectDownload(transfer, digest);
+    state.incomingTransfers.delete(directKey(message.id));
+    sendDirectMessageToPeer(peerId, {
+      type: 'direct-file-complete-ack',
+      id: message.id,
+      sha256: digest,
+    });
+  } catch (error) {
+    await failIncomingDirectTransfer(peerId, transfer, error.message);
+  }
+};
+
+const handleDirectRemoteError = (peerId, message) => {
+  const error = createFallbackError(message.message || '局域网直连传输失败。');
+  rejectDirectWaitersForTransfer(message.id, error);
+  const trackerInfo = state.transferTrackers.get(message.id);
+  if (trackerInfo) {
+    trackerInfo.tracker.cancelled = true;
+    trackerInfo.tracker.cancelledReason = error.message;
+    state.transferTrackers.delete(message.id);
+  }
+  const transfer = state.incomingTransfers.get(directKey(message.id));
+  if (transfer) {
+    if (transfer.display) {
+      failTransferDisplay(transfer.display, error.message);
+    }
+    cleanupDirectTransferStorage(transfer);
+    state.incomingTransfers.delete(directKey(message.id));
+  }
+  appendStatus(dom.fileStatus, `${peerLabel(peerId)} 的局域网直连失败：${error.message}`);
+};
+
+const handleLegacyDataChannelMessage = (peerId, message) => {
+  if (message.type === 'file-meta') {
+    const key = dataChannelKey(peerId);
+    const display = createTransferDisplay({
+      direction: 'inbound',
+      peerId,
+      name: message.name,
+      size: message.size,
+    });
+    state.incomingTransfers.set(key, {
+      meta: message,
+      chunks: [],
+      receivedBytes: 0,
+      display,
+      peerId,
+      mode: 'webrtc',
+    });
+    updateTransferDisplay(display, {
+      percent: 0,
+      status: `等待来自 ${peerLabel(peerId)} 的数据…`,
+    });
+    appendStatus(
+      dom.fileStatus,
+      `正在接收来自 ${peerLabel(peerId)} 的 "${message.name}"（${humanFileSize(message.size)}）`,
+    );
+  } else if (message.type === 'file-complete') {
+    const key = dataChannelKey(peerId);
+    const transfer = state.incomingTransfers.get(key);
+    if (!transfer) return;
+    if (message.id && transfer.meta.id && message.id !== transfer.meta.id) {
+      return;
+    }
+    const blob = new Blob(transfer.chunks, { type: transfer.meta.mime || 'application/octet-stream' });
+    const filename = transfer.meta.name || '接收文件';
+    const downloadUrl = triggerDownload(blob, filename);
+    const link = document.createElement('a');
+    link.href = downloadUrl;
+    link.download = filename;
+    link.textContent = `重新下载 ${filename}`;
+    link.className = 'download-link';
+    link.rel = 'noopener';
+    const actions = document.createElement('div');
+    actions.className = 'transfer-actions';
+    actions.appendChild(link);
+    if (transfer.display) {
+      completeTransferDisplay(transfer.display, `已接收完成，正在保存 "${filename}"`);
+      transfer.display.entry.appendChild(actions);
+      updateStatusPanelScroll(dom.fileStatus);
+    } else if (dom.fileStatus) {
+      dom.fileStatus.appendChild(actions);
+      updateStatusPanelScroll(dom.fileStatus);
+    }
+    appendStatus(dom.fileStatus, `文件 "${transfer.meta.name}" 已保存并可再次下载。`);
+    state.incomingTransfers.delete(key);
+    setTimeout(() => {
+      URL.revokeObjectURL(downloadUrl);
+      if (link.isConnected) {
+        link.textContent = `${filename} 下载链接已过期`;
+        link.removeAttribute('href');
+        link.classList.add('download-link-disabled');
+      }
+    }, 5 * 60 * 1000);
+  }
+};
+
 const handleDataChannelMessage = (peerId, data) => {
   if (typeof data === 'string') {
     try {
       const message = JSON.parse(data);
-      if (message.type === 'file-meta') {
-        const key = dataChannelKey(peerId);
-        const display = createTransferDisplay({
-          direction: 'inbound',
-          peerId,
-          name: message.name,
-          size: message.size,
+      if (message.type === 'direct-file-offer') {
+        handleDirectFileOffer(peerId, message).catch((error) => {
+          appendStatus(dom.fileStatus, `处理直连请求失败：${error.message}`);
         });
-        state.incomingTransfers.set(key, {
-          meta: message,
-          chunks: [],
-          receivedBytes: 0,
-          display,
-          peerId,
-          mode: 'webrtc',
+      } else if (message.type === 'direct-file-accept' || message.type === 'direct-file-reject') {
+        settleDirectControl(message);
+      } else if (message.type === 'direct-file-chunk') {
+        handleDirectFileChunkMeta(peerId, message).catch((error) => {
+          appendStatus(dom.fileStatus, `处理直连分片信息失败：${error.message}`);
         });
-        updateTransferDisplay(display, {
-          percent: 0,
-          status: `等待来自 ${peerLabel(peerId)} 的数据…`,
+      } else if (message.type === 'direct-file-chunk-ack') {
+        settleDirectChunkAck(message);
+      } else if (message.type === 'direct-file-complete') {
+        handleDirectFileComplete(peerId, message).catch((error) => {
+          appendStatus(dom.fileStatus, `完成直连传输失败：${error.message}`);
         });
-        appendStatus(
-          dom.fileStatus,
-          `正在接收来自 ${peerLabel(peerId)} 的 "${message.name}"（${humanFileSize(message.size)}）`,
-        );
-      } else if (message.type === 'file-complete') {
-        const key = dataChannelKey(peerId);
-        const transfer = state.incomingTransfers.get(key);
-        if (!transfer) return;
-        if (message.id && transfer.meta.id && message.id !== transfer.meta.id) {
-          return;
-        }
-        const blob = new Blob(transfer.chunks, { type: transfer.meta.mime || 'application/octet-stream' });
-        const filename = transfer.meta.name || '接收文件';
-        const downloadUrl = triggerDownload(blob, filename);
-        const link = document.createElement('a');
-        link.href = downloadUrl;
-        link.download = filename;
-        link.textContent = `重新下载 ${filename}`;
-        link.className = 'download-link';
-        link.rel = 'noopener';
-        const actions = document.createElement('div');
-        actions.className = 'transfer-actions';
-        actions.appendChild(link);
-        if (transfer.display) {
-          completeTransferDisplay(transfer.display, `已接收完成，正在保存 "${filename}"`);
-          transfer.display.entry.appendChild(actions);
-          updateStatusPanelScroll(dom.fileStatus);
-        } else if (dom.fileStatus) {
-          dom.fileStatus.appendChild(actions);
-          updateStatusPanelScroll(dom.fileStatus);
-        }
-        appendStatus(dom.fileStatus, `文件 "${transfer.meta.name}" 已保存并可再次下载。`);
-        state.incomingTransfers.delete(key);
-        setTimeout(() => {
-          URL.revokeObjectURL(downloadUrl);
-          if (link.isConnected) {
-            link.textContent = `${filename} 下载链接已过期`;
-            link.removeAttribute('href');
-            link.classList.add('download-link-disabled');
-          }
-        }, 5 * 60 * 1000);
+      } else if (message.type === 'direct-file-complete-ack') {
+        settleDirectControl(message);
+      } else if (message.type === 'direct-file-error') {
+        handleDirectRemoteError(peerId, message);
+      } else {
+        handleLegacyDataChannelMessage(peerId, message);
       }
     } catch {
       /* ignored */
     }
   } else if (data instanceof ArrayBuffer) {
+    const hasDirectPendingChunk = Array.from(state.incomingTransfers.values()).some(
+      (item) => item.peerId === peerId && item.mode === 'direct' && item.pendingChunk,
+    );
+    if (hasDirectPendingChunk) {
+      handleDirectBinaryChunk(peerId, data).catch((error) => {
+        appendStatus(dom.fileStatus, `写入直连分片失败：${error.message}`);
+      });
+      return;
+    }
     const key = dataChannelKey(peerId);
     const transfer = state.incomingTransfers.get(key);
     if (!transfer) return;
@@ -1279,15 +2116,200 @@ const waitForSendBuffer = (channel) =>
     channel.addEventListener('bufferedamountlow', handler);
   });
 
-const waitForSocketBuffer = async (socket) => {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return;
-  while (socket.readyState === WebSocket.OPEN && socket.bufferedAmount > WS_BUFFER_THRESHOLD) {
-    // eslint-disable-next-line no-await-in-loop
-    await new Promise((resolve) => setTimeout(resolve, 16));
-  }
+const createServerTransfer = async (peerId, file) => {
+  const response = await fetch('/api/transfers', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      senderId: state.selfId,
+      targetId: peerId,
+      name: file.name,
+      size: file.size,
+      mime: file.type || 'application/octet-stream',
+      chunkSize: HTTP_FILE_CHUNK_SIZE,
+    }),
+  });
+  return readJsonResponse(response);
 };
 
-const sendFileViaRelay = async (peerId, file, display, tracker) => {
+const uploadTransferChunk = async ({
+  transferId,
+  uploadToken,
+  index,
+  offset,
+  chunk,
+  chunkHash,
+}) => {
+  const response = await fetch(
+    `/api/transfers/${encodeURIComponent(transferId)}/chunks/${index}`,
+    {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'X-Upload-Token': uploadToken,
+        'X-Chunk-Offset': String(offset),
+        'X-Chunk-Size': String(chunk.byteLength),
+        'X-Chunk-SHA256': chunkHash,
+      },
+      body: chunk,
+    },
+  );
+  return readJsonResponse(response);
+};
+
+const completeServerTransfer = async ({ transferId, uploadToken, sha256, totalChunks }) => {
+  const response = await fetch(`/api/transfers/${encodeURIComponent(transferId)}/complete`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      uploadToken,
+      sha256,
+      totalChunks,
+    }),
+  });
+  return readJsonResponse(response);
+};
+
+const cancelServerTransfer = async (transferId, uploadToken) => {
+  if (!transferId || !uploadToken) return;
+  await fetch(`/api/transfers/${encodeURIComponent(transferId)}`, {
+    method: 'DELETE',
+    headers: {
+      'X-Upload-Token': uploadToken,
+    },
+  }).catch(() => {});
+};
+
+const sendFileViaDirect = async (peerId, file, display, tracker) => {
+  if (!('RTCPeerConnection' in window)) {
+    throw createFallbackError('当前浏览器不支持局域网直连。');
+  }
+
+  updateTransferDisplay(display, {
+    percent: 0,
+    status: '正在尝试局域网直连…',
+  });
+
+  const context = await withTimeout(
+    preparePeerConnection(peerId),
+    DIRECT_CONNECT_TIMEOUT,
+    createFallbackError('局域网直连握手超时。'),
+  );
+  const channel = context.dataChannel;
+  if (!channel || channel.readyState !== 'open') {
+    throw createFallbackError('局域网直连通道不可用。');
+  }
+
+  const transferId = `direct-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+  tracker.mode = 'direct';
+  tracker.transferId = transferId;
+  tracker.cancelled = false;
+  tracker.cancelledReason = undefined;
+  state.outgoingTransfers.set(peerId, tracker);
+  state.transferTrackers.set(transferId, { tracker, peerId });
+
+  const offerResponsePromise = waitForDirectControl(
+    transferId,
+    ['direct-file-accept', 'direct-file-reject'],
+    peerId,
+  );
+  sendDataChannelMessage(channel, {
+    type: 'direct-file-offer',
+    id: transferId,
+    name: file.name,
+    size: file.size,
+    mime: file.type || 'application/octet-stream',
+    chunkSize: DIRECT_FILE_CHUNK_SIZE,
+  });
+
+  const response = await offerResponsePromise;
+  if (response.type === 'direct-file-reject') {
+    throw createFallbackError(response.message || '接收端拒绝局域网直连。');
+  }
+
+  updateTransferDisplay(display, {
+    percent: 0,
+    status:
+      response.storage === 'direct-save'
+        ? '局域网直连已建立，正在实时写入接收端文件…'
+        : response.storage === 'opfs'
+        ? '局域网直连已建立，正在向接收端临时文件写入…'
+        : '局域网直连已建立，正在发送…',
+  });
+  appendStatus(dom.fileStatus, `已与 ${peerLabel(peerId)} 建立局域网直连，开始发送 "${file.name}"。`);
+
+  const fileHasher = await createSha256();
+  const chunkHasher = await createSha256();
+  let offset = 0;
+  let chunkIndex = 0;
+  const totalChunks = file.size ? Math.ceil(file.size / DIRECT_FILE_CHUNK_SIZE) : 0;
+
+  while (offset < file.size) {
+    const slice = file.slice(offset, offset + DIRECT_FILE_CHUNK_SIZE);
+    // eslint-disable-next-line no-await-in-loop
+    const buffer = await slice.arrayBuffer();
+    const chunk = new Uint8Array(buffer);
+    fileHasher.update(chunk);
+    // eslint-disable-next-line no-await-in-loop
+    const chunkHash = await hashBytes(chunkHasher, chunk);
+    const ackPromise = waitForDirectChunkAck(transferId, chunkIndex, peerId);
+    sendDataChannelMessage(channel, {
+      type: 'direct-file-chunk',
+      id: transferId,
+      index: chunkIndex,
+      offset,
+      size: chunk.byteLength,
+      sha256: chunkHash,
+    });
+    channel.send(buffer);
+    // eslint-disable-next-line no-await-in-loop
+    await waitForSendBuffer(channel);
+    // eslint-disable-next-line no-await-in-loop
+    await ackPromise;
+
+    offset += chunk.byteLength;
+    chunkIndex += 1;
+    const percent = file.size ? Math.min(100, Math.round((offset / file.size) * 100)) : 100;
+    updateTransferDisplay(display, {
+      percent,
+      status: `局域网直连发送 ${percent}% · 已确认分片 ${chunkIndex}/${totalChunks}`,
+    });
+    if (tracker.cancelled) {
+      throw createFallbackError(tracker.cancelledReason || '局域网直连已中止。');
+    }
+    if (chunkIndex % 4 === 0) {
+      // eslint-disable-next-line no-await-in-loop
+      await microDelay();
+    }
+  }
+
+  const fileHash = fileHasher.digest('hex');
+  const completeAckPromise = waitForDirectControl(
+    transferId,
+    'direct-file-complete-ack',
+    peerId,
+    DIRECT_CHUNK_ACK_TIMEOUT,
+  );
+  sendDataChannelMessage(channel, {
+    type: 'direct-file-complete',
+    id: transferId,
+    sha256: fileHash,
+    totalChunks,
+  });
+  const completeAck = await completeAckPromise;
+  completeTransferDisplay(
+    display,
+    `已通过局域网直连发送，SHA-256：${shortHash(completeAck.sha256 || fileHash)}`,
+  );
+  appendStatus(dom.fileStatus, `局域网直连发送完成：${file.name}。`);
+  state.transferTrackers.delete(transferId);
+};
+
+const sendFileViaHttpRelay = async (peerId, file, display, tracker) => {
   const socket = state.ws;
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     const message = '无法连接服务器进行文件中转。';
@@ -1300,64 +2322,85 @@ const sendFileViaRelay = async (peerId, file, display, tracker) => {
   if (tracker.transferId) {
     state.transferTrackers.delete(tracker.transferId);
   }
-  const transferId = `relay-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
-  tracker.mode = 'relay';
+  updateTransferDisplay(display, {
+    percent: 0,
+    status: '正在创建安全传输会话…',
+  });
+
+  const session = await createServerTransfer(peerId, file);
+  const transferId = session.transferId;
+  const uploadToken = session.uploadToken;
+  const chunkSize = session.chunkSize || HTTP_FILE_CHUNK_SIZE;
+  tracker.mode = 'http-relay';
   tracker.transferId = transferId;
+  tracker.uploadToken = uploadToken;
   tracker.cancelled = false;
   tracker.cancelledReason = undefined;
   state.outgoingTransfers.set(peerId, tracker);
   state.transferTrackers.set(transferId, { tracker, peerId });
-  sendWsMessage('file-transfer-meta', {
-    targetId: peerId,
-    transferId,
-    name: file.name,
-    size: file.size,
-    mime: file.type,
-  });
   updateTransferDisplay(display, {
     percent: 0,
-    status: `通过服务器发送「${file.name || '文件'}」…`,
+    status: `正在分片上传「${file.name || '文件'}」…`,
   });
-  appendStatus(dom.fileStatus, `尝试通过服务器向 ${peerLabel(peerId)} 发送 "${file.name}"`);
+  appendStatus(dom.fileStatus, `开始向 ${peerLabel(peerId)} 上传 "${file.name}"，分片大小 ${humanFileSize(chunkSize)}。`);
 
-  const buffer = await file.arrayBuffer();
-  const view = new Uint8Array(buffer);
+  const fileHasher = await createSha256();
+  const chunkHasher = await createSha256();
   let offset = 0;
   let chunkIndex = 0;
-  while (offset < view.length) {
-    const chunk = view.slice(offset, offset + WS_FALLBACK_CHUNK_SIZE);
-    sendWsMessage('file-transfer-chunk', {
-      targetId: peerId,
-      transferId,
-      index: chunkIndex,
-      data: bufferToBase64(chunk),
-    });
+  const totalChunks = file.size ? Math.ceil(file.size / chunkSize) : 0;
+
+  while (offset < file.size) {
+    const slice = file.slice(offset, offset + chunkSize);
     // eslint-disable-next-line no-await-in-loop
-    await waitForSocketBuffer(socket);
-    offset += chunk.length;
+    const buffer = await slice.arrayBuffer();
+    const chunk = new Uint8Array(buffer);
+    fileHasher.update(chunk);
+    // eslint-disable-next-line no-await-in-loop
+    const chunkHash = await hashBytes(chunkHasher, chunk);
+    // eslint-disable-next-line no-await-in-loop
+    await uploadTransferChunk({
+      transferId,
+      uploadToken,
+      index: chunkIndex,
+      offset,
+      chunk,
+      chunkHash,
+    });
+
+    offset += chunk.byteLength;
     chunkIndex += 1;
-    const percent = Math.min(100, Math.round((offset / view.length) * 100));
+    const percent = file.size ? Math.min(100, Math.round((offset / file.size) * 100)) : 100;
     updateTransferDisplay(display, {
       percent,
-      status: `通过服务器发送 ${percent}%`,
+      status: `已上传 ${percent}% · 已校验分片 ${chunkIndex}/${totalChunks}`,
     });
-    if (chunkIndex % 5 === 0) {
-      // 让浏览器有机会刷新 UI
-      // eslint-disable-next-line no-await-in-loop
-      await microDelay();
-    }
+
     if (tracker.cancelled) {
       throw new Error(tracker.cancelledReason || '对方已取消接收。');
     }
+    if (chunkIndex % 2 === 0) {
+      // eslint-disable-next-line no-await-in-loop
+      await microDelay();
+    }
   }
 
-  sendWsMessage('file-transfer-complete', {
-    targetId: peerId,
-    transferId,
-    name: file.name,
+  const fileHash = fileHasher.digest('hex');
+  updateTransferDisplay(display, {
+    percent: 100,
+    status: '上传完成，服务器正在校验整文件…',
   });
-  appendStatus(dom.fileStatus, `已通过服务器向 ${peerLabel(peerId)} 发送 "${file.name}"`);
-  completeTransferDisplay(display, `已通过服务器发送 "${file.name}"`);
+  const completion = await completeServerTransfer({
+    transferId,
+    uploadToken,
+    sha256: fileHash,
+    totalChunks,
+  });
+  appendStatus(
+    dom.fileStatus,
+    `服务器已校验 "${file.name}"，SHA-256：${shortHash(completion.sha256 || fileHash)}。`,
+  );
+  completeTransferDisplay(display, `已完成并校验 SHA-256：${shortHash(completion.sha256 || fileHash)}`);
   state.transferTrackers.delete(transferId);
 };
 
@@ -1369,18 +2412,47 @@ const sendFile = async (peerId, file) => {
     size: file.size,
   });
   if (display) {
-    updateTransferDisplay(display, { percent: 0, status: '准备通过服务器发送…' });
+    updateTransferDisplay(display, { percent: 0, status: '准备局域网直连…' });
   }
-  const tracker = { display, fileName: file.name, mode: 'relay', cancelled: false, transferId: undefined };
+  const tracker = { display, fileName: file.name, mode: 'direct', cancelled: false, transferId: undefined };
   state.outgoingTransfers.set(peerId, tracker);
 
   try {
-    await sendFileViaRelay(peerId, file, display, tracker);
+    try {
+      await sendFileViaDirect(peerId, file, display, tracker);
+    } catch (directError) {
+      const directReason =
+        tracker.cancelled === true
+          ? tracker.cancelledReason || directError.message
+          : directError.message;
+      if (tracker.transferId) {
+        const channel = getPeerChannel(peerId);
+        if (channel?.readyState === 'open') {
+          channel.send(JSON.stringify({
+            type: 'direct-file-error',
+            id: tracker.transferId,
+            message: '发送端切换到服务器中转。',
+          }));
+        }
+        rejectDirectWaitersForTransfer(tracker.transferId, createFallbackError(directReason));
+        state.transferTrackers.delete(tracker.transferId);
+        tracker.transferId = undefined;
+      }
+      tracker.cancelled = false;
+      tracker.cancelledReason = undefined;
+      appendStatus(dom.fileStatus, `局域网直连不可用，切换到服务器中转：${directReason}`);
+      updateTransferDisplay(display, {
+        percent: 0,
+        status: '局域网直连不可用，正在切换到服务器中转…',
+      });
+      await sendFileViaHttpRelay(peerId, file, display, tracker);
+    }
   } catch (error) {
     const reason =
       tracker.cancelled === true
         ? tracker.cancelledReason || error.message
         : error.message;
+    await cancelServerTransfer(tracker.transferId, tracker.uploadToken);
     if (tracker.transferId) {
       state.transferTrackers.delete(tracker.transferId);
       tracker.transferId = undefined;
@@ -1802,6 +2874,123 @@ const handleSocketMessage = async (event) => {
       break;
     }
     case 'poke': {
+      break;
+    }
+    case 'large-file-meta': {
+      const { from, transferId, name, size, mime } = payload;
+      if (!from || !transferId) {
+        break;
+      }
+      const key = relayKey(transferId);
+      const display = createTransferDisplay({
+        direction: 'inbound',
+        peerId: from,
+        name,
+        size,
+      });
+      state.incomingTransfers.set(key, {
+        meta: { id: transferId, name, size, mime },
+        receivedBytes: 0,
+        display,
+        peerId: from,
+        mode: 'http-relay',
+      });
+      updateTransferDisplay(display, {
+        percent: 0,
+        status: `等待 ${peerLabel(from)} 上传到本机服务器…`,
+      });
+      appendStatus(
+        dom.fileStatus,
+        `${peerLabel(from)} 正在发送 "${name || '文件'}"（${humanFileSize(size)}），服务器将先落盘校验。`,
+      );
+      break;
+    }
+    case 'large-file-progress': {
+      const { transferId, receivedBytes, size, percent } = payload;
+      if (!transferId) {
+        break;
+      }
+      const key = relayKey(transferId);
+      const transfer = state.incomingTransfers.get(key);
+      if (!transfer) {
+        break;
+      }
+      transfer.receivedBytes = receivedBytes || transfer.receivedBytes || 0;
+      const resolvedPercent =
+        typeof percent === 'number'
+          ? percent
+          : size
+          ? Math.min(100, Math.round((transfer.receivedBytes / size) * 100))
+          : 0;
+      updateTransferDisplay(transfer.display, {
+        percent: resolvedPercent,
+        status: `发送方上传并校验分片 ${resolvedPercent}%`,
+      });
+      break;
+    }
+    case 'large-file-ready': {
+      const { from, transferId, name, size, mime, sha256, downloadUrl } = payload;
+      if (!transferId || !downloadUrl) {
+        break;
+      }
+      const key = relayKey(transferId);
+      let transfer = state.incomingTransfers.get(key);
+      if (!transfer) {
+        const display = createTransferDisplay({
+          direction: 'inbound',
+          peerId: from,
+          name,
+          size,
+        });
+        transfer = {
+          meta: { id: transferId, name, size, mime },
+          receivedBytes: size || 0,
+          display,
+          peerId: from,
+          mode: 'http-relay',
+        };
+        state.incomingTransfers.set(key, transfer);
+      }
+      transfer.meta.sha256 = sha256;
+      transfer.meta.downloadUrl = downloadUrl;
+      if (transfer.display?.meta) {
+        transfer.display.meta.textContent = `${humanFileSize(size)} · SHA-256 ${shortHash(sha256)}`;
+      }
+      completeTransferDisplay(
+        transfer.display,
+        `服务器校验完成，可下载 "${name || transfer.meta.name || '文件'}"`,
+      );
+      appendDownloadActions(transfer.display, payload);
+      appendStatus(
+        dom.fileStatus,
+        `文件 "${name || transfer.meta.name || '文件'}" 已通过 SHA-256 校验：${shortHash(sha256)}。`,
+      );
+      triggerDownloadUrl(downloadUrl, name || transfer.meta.name || '接收文件');
+      state.incomingTransfers.delete(key);
+      break;
+    }
+    case 'large-file-error': {
+      const { transferId, message: errorMessage, from } = payload;
+      if (transferId) {
+        const key = relayKey(transferId);
+        const transfer = state.incomingTransfers.get(key);
+        if (transfer?.display) {
+          failTransferDisplay(transfer.display, errorMessage || '大文件传输失败。');
+        }
+        if (transfer) {
+          state.incomingTransfers.delete(key);
+        }
+        const trackerInfo = state.transferTrackers.get(transferId);
+        if (trackerInfo) {
+          trackerInfo.tracker.cancelled = true;
+          trackerInfo.tracker.cancelledReason = errorMessage || '大文件传输失败。';
+          state.transferTrackers.delete(transferId);
+        }
+      }
+      appendStatus(
+        dom.fileStatus,
+        `大文件传输失败：${peerLabel(from || payload?.targetId || '未知设备')} · ${errorMessage || '请稍后重试。'}`,
+      );
       break;
     }
     case 'file-transfer-meta': {
